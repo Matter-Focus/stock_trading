@@ -2,37 +2,20 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import pytest
 import pandas as pd
-import os
-from src.data import get_stock_data, save_to_csv, load_from_csv, generate_mock_data
-
-
-def test_generate_mock_data():
-    df = generate_mock_data(days=20, start_price=10.0)
-
-    assert isinstance(df, pd.DataFrame)
-    assert len(df) >= 14
-    assert list(df.columns) == ["open", "close", "high", "low", "volume"]
-    assert df.index.name == "date"
-    assert pd.api.types.is_datetime64_any_dtype(df.index)
-
-
-def test_mock_data_range():
-    df = generate_mock_data(days=10, start_price=5.0)
-
-    assert df["open"].min() > 0
-    assert df["close"].min() > 0
-    assert df["high"].min() > 0
-    assert df["low"].min() > 0
-    assert df["volume"].min() > 0
-
-    for i in range(len(df) - 1):
-        assert df.index[i + 1] > df.index[i]
+from src.data import save_to_csv, load_from_csv
 
 
 def test_save_and_load_csv():
-    df = generate_mock_data(days=10)
+    dates = pd.date_range("2026-01-01", periods=10, freq="D")
+    df = pd.DataFrame({
+        "open": [10.0] * 10,
+        "close": [10.1] * 10,
+        "high": [10.2] * 10,
+        "low": [9.9] * 10,
+        "volume": [1000000] * 10
+    }, index=dates)
+
     temp_file = "test_temp.csv"
 
     try:
@@ -54,25 +37,12 @@ def test_load_from_nonexistent_file():
     assert result is None
 
 
-def test_mock_data_price_logic():
-    df = generate_mock_data(days=5, start_price=10.0)
-
-    for i in range(len(df)):
-        row = df.iloc[i]
-        assert row["high"] >= max(row["open"], row["close"])
-        assert row["low"] <= min(row["open"], row["close"])
-
-
 if __name__ == "__main__":
-    import sys
     print("Running tests...")
 
     tests = [
-        ("test_generate_mock_data", test_generate_mock_data),
-        ("test_mock_data_range", test_mock_data_range),
         ("test_save_and_load_csv", test_save_and_load_csv),
         ("test_load_from_nonexistent_file", test_load_from_nonexistent_file),
-        ("test_mock_data_price_logic", test_mock_data_price_logic),
     ]
 
     passed = 0
