@@ -62,6 +62,55 @@ def generate_mock_data(days: int = 252, start_price: float = 10.0) -> pd.DataFra
     return df
 
 
+def _get_stock_data_direct_api(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Fallback method: fetch data directly from East Money API without akshare.
+    """
+    import requests
+
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": "0.%s" % stock_code if stock_code.startswith("0") else "1.%s" % stock_code,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",
+        "fqt": "1",
+        "beg": start_date,
+        "end": end_date,
+        "lmt": "1000",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    response = requests.get(url, params=params, headers=headers, timeout=30)
+    response.raise_for_status()
+
+    data = response.json()
+    klines = data.get("data", {}).get("klines", [])
+
+    if not klines:
+        raise ValueError("No data returned for stock %s" % stock_code)
+
+    rows = []
+    for line in klines:
+        parts = line.split(",")
+        rows.append({
+            "date": parts[0],
+            "open": float(parts[1]),
+            "close": float(parts[2]),
+            "high": float(parts[3]),
+            "low": float(parts[4]),
+            "volume": int(float(parts[5])),
+        })
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date")
+    df = df.sort_index(ascending=True)
+    return df
+
+
 def get_stock_data(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
     Get A-share daily stock data.
@@ -74,32 +123,35 @@ def get_stock_data(stock_code: str, start_date: str, end_date: str) -> pd.DataFr
     Returns:
         DataFrame with columns: date, open, close, high, low, volume
     """
-    import akshare as ak
-    df = ak.stock_zh_a_hist(
-        symbol=stock_code,
-        period="daily",
-        start_date=start_date,
-        end_date=end_date,
-        adjust="qfq"
-    )
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_hist(
+            symbol=stock_code,
+            period="daily",
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq"
+        )
 
-    column_mapping = {
-        "日期": "date",
-        "开盘": "open",
-        "收盘": "close",
-        "最高": "high",
-        "最低": "low",
-        "成交量": "volume"
-    }
+        column_mapping = {
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume"
+        }
 
-    df = df.rename(columns=column_mapping)
-    df = df[["date", "open", "close", "high", "low", "volume"]]
-    df = df.dropna()
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.set_index("date")
-    df = df.sort_index(ascending=True)
-
-    return df
+        df = df.rename(columns=column_mapping)
+        df = df[["date", "open", "close", "high", "low", "volume"]]
+        df = df.dropna()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+        df = df.sort_index(ascending=True)
+        return df
+    except ImportError:
+        # Fallback to direct API if akshare is not installed
+        return _get_stock_data_direct_api(stock_code, start_date, end_date)
 
 
 def save_to_csv(df: pd.DataFrame, filename: str) -> None:
