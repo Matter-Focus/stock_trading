@@ -5,6 +5,10 @@ import os
 
 
 def _get_exchange_prefix(stock_code: str) -> str:
+    if stock_code.startswith("sh") or stock_code.startswith("SH"):
+        return ""
+    if stock_code.startswith("sz") or stock_code.startswith("SZ"):
+        return ""
     if stock_code.startswith("6"):
         return "sh"
     else:
