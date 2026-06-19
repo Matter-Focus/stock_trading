@@ -2,9 +2,10 @@
 """
 A股回测撮合引擎
 功能：基于交易信号执行买入/卖出，计算收益率、最大回撤、夏普比率等指标
+支持风控：止损止盈、仓位限制、交易次数限制
 """
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
 
@@ -21,6 +22,8 @@ class Trade:
     sell_commission: float  # 卖出佣金
     sell_stamp_tax: float   # 卖出印花税
     profit: float          # 盈亏金额
+    stop_loss_triggered: bool = False  # 是否触发止损
+    take_profit_triggered: bool = False  # 是否触发止盈
 
 
 class BacktestEngine:
@@ -32,6 +35,7 @@ class BacktestEngine:
     - 卖出：次日开盘价 × (1 - 滑点)，佣金万2.5 + 印花税千0.5
     - 涨跌停：涨停不能买，跌停不能卖
     - 停牌：次日成交量为0则跳过
+    - 风控：止损、止盈、仓位限制、交易次数限制
     """
 
     def __init__(
@@ -39,12 +43,23 @@ class BacktestEngine:
         initial_capital: float = 100000.0,
         commission_rate: float = 0.00025,
         stamp_tax_rate: float = 0.0005,
-        slippage: float = 0.001
+        slippage: float = 0.001,
+        # 风控参数
+        stop_loss_pct: float = 0.05,
+        take_profit_pct: float = 0.15,
+        max_position_pct: float = 0.8,
+        max_trade_count: int = 50
     ):
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
         self.stamp_tax_rate = stamp_tax_rate
         self.slippage = slippage
+
+        # 风控参数
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
+        self.max_position_pct = max_position_pct
+        self.max_trade_count = max_trade_count
 
     def _calculate_commission(self, amount: float) -> float:
         """佣金计算：成交金额 × 佣金率，不足5元按5元收"""
@@ -74,6 +89,31 @@ class BacktestEngine:
         next_volume = df["volume"].iloc[idx + 1]
         return next_volume == 0
 
+    def _check_stop_loss(self, entry_price: float, current_price: float) -> bool:
+        """止损检查：当前价格相对买入价下跌超过止损比例"""
+        if entry_price <= 0:
+            return False
+        loss_pct = (entry_price - current_price) / entry_price
+        return loss_pct >= self.stop_loss_pct
+
+    def _check_take_profit(self, entry_price: float, current_price: float) -> bool:
+        """止盈检查：当前价格相对买入价上涨超过止盈比例"""
+        if entry_price <= 0:
+            return False
+        profit_pct = (current_price - entry_price) / entry_price
+        return profit_pct >= self.take_profit_pct
+
+    def _check_position_limit(self, available_capital: float, trade_value: float) -> bool:
+        """仓位限制检查：本次交易金额是否超过最大仓位比例"""
+        if available_capital <= 0:
+            return False
+        position_pct = trade_value / available_capital
+        return position_pct <= self.max_position_pct
+
+    def _check_trade_limit(self, current_trade_count: int) -> bool:
+        """交易次数限制检查：是否超过最大交易次数"""
+        return current_trade_count < self.max_trade_count
+
     def run(self, df: pd.DataFrame) -> Dict:
         """
         执行回测
@@ -94,11 +134,21 @@ class BacktestEngine:
         avg_cost = 0.0
         trades: List[Trade] = []
         equity_curve: List[float] = []
-
         pending_buy = None  # 待入账的买入信息
+        trade_count = 0  # 已完成交易次数
 
         for idx in range(len(df) - 1):
+            current_price = df["close"].iloc[idx]
             signal = df["signal"].iloc[idx] if "signal" in df.columns else 0
+
+            # ========== 风控：持仓期间每日检查止损止盈 ==========
+            if position > 0:
+                # 触发止损
+                if self._check_stop_loss(avg_cost, current_price):
+                    signal = -1  # 强制卖出
+                # 触发止盈
+                elif self._check_take_profit(avg_cost, current_price):
+                    signal = -1  # 强制卖出
 
             # ========== 买入逻辑 ==========
             if signal == 1 and position == 0:
@@ -109,12 +159,25 @@ class BacktestEngine:
                 if self._check_suspension(df, idx):
                     continue
 
+                # ========== 风控：买入前检查交易次数限制 ==========
+                if not self._check_trade_limit(trade_count):
+                    continue  # 交易次数超限，拒绝买入
+
                 # 成交价 = 次日开盘价 × (1 + 滑点)
                 next_open = df["open"].iloc[idx + 1]
                 buy_price = next_open * (1 + self.slippage)
 
-                # 买入数量 = 100股整数倍
-                max_volume = int(capital // buy_price // 100 * 100)
+                # 计算最大可买数量
+                max_volume_by_capital = int(capital // buy_price // 100 * 100)
+
+                # ========== 风控：买入前检查仓位限制 ==========
+                # 计算按仓位限制的最大可买数量
+                max_position_value = capital * self.max_position_pct
+                max_volume_by_position = int(max_position_value // buy_price // 100 * 100)
+
+                # 取两个限制的较小值
+                max_volume = min(max_volume_by_capital, max_volume_by_position)
+
                 if max_volume <= 0:
                     continue
 
@@ -139,12 +202,13 @@ class BacktestEngine:
 
             # ========== 卖出逻辑 ==========
             elif signal == -1 and position > 0:
-                # 跌停不能卖出
-                if self._check_limit_down(df, idx):
-                    continue
-                # 停牌不能卖出
-                if self._check_suspension(df, idx):
-                    continue
+                # 跌停不能卖出（只有原始卖出信号才检查，止损止盈不受此限制）
+                original_signal = df["signal"].iloc[idx] if "signal" in df.columns else 0
+                if original_signal == -1:
+                    if self._check_limit_down(df, idx):
+                        continue
+                    if self._check_suspension(df, idx):
+                        continue
 
                 # 成交价 = 次日开盘价 × (1 - 滑点)
                 next_open = df["open"].iloc[idx + 1]
@@ -167,8 +231,11 @@ class BacktestEngine:
                 sell_date = str(df.index[idx + 1].date())
 
                 # 计算盈亏（含手续费）
-                cost = avg_cost * sell_volume + pending_buy["commission"] + sell_commission + sell_stamp_tax
                 profit = net_revenue - (avg_cost * sell_volume)
+
+                # 判断是否触发风控
+                stop_loss_triggered = self._check_stop_loss(pending_buy["price"], current_price) if pending_buy else False
+                take_profit_triggered = self._check_take_profit(pending_buy["price"], current_price) if pending_buy else False
 
                 # 配对记录买入和卖出
                 if pending_buy:
@@ -181,20 +248,21 @@ class BacktestEngine:
                         sell_price=sell_price,
                         sell_commission=sell_commission,
                         sell_stamp_tax=sell_stamp_tax,
-                        profit=round(profit, 2)
+                        profit=round(profit, 2),
+                        stop_loss_triggered=stop_loss_triggered,
+                        take_profit_triggered=take_profit_triggered
                     )
                     trades.append(trade)
                     pending_buy = None
+                    trade_count += 1  # 完成一笔交易
 
             # ========== 更新权益曲线 ==========
-            current_price = df["close"].iloc[idx]
             equity = capital + position * current_price
             equity_curve.append(equity)
 
         # 如果还有未卖出的持仓，按最后收盘价计算
         if position > 0:
             final_price = df["close"].iloc[-1]
-            unrealized_profit = position * (final_price - avg_cost)
             equity_curve.append(capital + position * final_price)
 
         # ========== 计算绩效指标 ==========
@@ -218,18 +286,15 @@ class BacktestEngine:
         if len(daily_returns) > 0 and np.std(daily_returns) > 0:
             mean_return = np.mean(daily_returns)
             std_return = np.std(daily_returns)
-            # 年化：日 Sharpe × sqrt(252)
             sharpe_ratio = (mean_return - 0.02 / 252) / std_return * np.sqrt(252)
         else:
             sharpe_ratio = 0.0
-
-        trade_count = len(trades)
 
         return {
             "total_return": round(total_return, 2),
             "max_drawdown": round(max_drawdown, 2),
             "sharpe_ratio": round(sharpe_ratio, 2),
-            "trade_count": trade_count,
+            "trade_count": len(trades),
             "trades": trades,
             "equity_curve": equity_curve,
             "final_equity": round(final_equity, 2),
@@ -252,12 +317,16 @@ if __name__ == "__main__":
     from src.strategy import generate_signals
     df = generate_signals(df)
 
-    # 创建回测引擎
+    # 创建回测引擎（带风控参数）
     engine = BacktestEngine(
         initial_capital=100000.0,
         commission_rate=0.00025,
         stamp_tax_rate=0.0005,
-        slippage=0.001
+        slippage=0.001,
+        stop_loss_pct=0.05,      # 止损5%
+        take_profit_pct=0.15,     # 止盈15%
+        max_position_pct=0.8,     # 最大仓位80%
+        max_trade_count=50        # 最大交易次数
     )
 
     # 执行回测
@@ -265,7 +334,7 @@ if __name__ == "__main__":
 
     # 打印结果
     print("\n" + "=" * 50)
-    print("回测结果")
+    print("回测结果（含风控）")
     print("=" * 50)
     print(f"初始资金: {result['initial_capital']:.2f} 元")
     print(f"最终资产: {result['final_equity']:.2f} 元")
@@ -279,7 +348,13 @@ if __name__ == "__main__":
         print("交易记录")
         print("-" * 50)
         for i, trade in enumerate(result["trades"], 1):
-            print(f"\n第{i}笔交易:")
+            trigger_reason = ""
+            if trade.stop_loss_triggered:
+                trigger_reason = "[止损]"
+            elif trade.take_profit_triggered:
+                trigger_reason = "[止盈]"
+
+            print(f"\n第{i}笔交易 {trigger_reason}:")
             print(f"  买入: {trade.buy_date} @ {trade.buy_price:.2f}元 × {trade.buy_volume}股")
             print(f"       佣金: {trade.buy_commission:.2f}元")
             print(f"  卖出: {trade.sell_date} @ {trade.sell_price:.2f}元 × {trade.buy_volume}股")

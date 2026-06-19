@@ -3,12 +3,33 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pandas as pd
+import numpy as np
 from src.strategy import generate_signals, get_buy_sell_points
-from src.data import generate_mock_data
+
+
+def create_test_data(days: int = 30, start_price: float = 10.0) -> pd.DataFrame:
+    """创建测试用数据"""
+    dates = pd.date_range("2026-01-01", periods=days, freq="D")
+    np.random.seed(42)
+
+    prices = [start_price]
+    for _ in range(days - 1):
+        change = prices[-1] * np.random.randn() * 0.02
+        prices.append(prices[-1] + change)
+
+    df = pd.DataFrame({
+        "open": prices,
+        "close": prices,
+        "high": [p * 1.02 for p in prices],
+        "low": [p * 0.98 for p in prices],
+        "volume": [1000000] * days
+    }, index=dates)
+
+    return df
 
 
 def test_generate_signals_columns():
-    df = generate_mock_data(days=30, start_price=10.0)
+    df = create_test_data(days=30)
     result = generate_signals(df, short_window=5, long_window=20)
 
     assert "ma5" in result.columns
@@ -17,7 +38,7 @@ def test_generate_signals_columns():
 
 
 def test_signal_values():
-    df = generate_mock_data(days=30, start_price=10.0)
+    df = create_test_data(days=30)
     result = generate_signals(df, short_window=5, long_window=20)
 
     signals = result["signal"].unique()
@@ -26,7 +47,7 @@ def test_signal_values():
 
 
 def test_buy_sell_points():
-    df = generate_mock_data(days=60, start_price=10.0)
+    df = create_test_data(days=60)
     df = generate_signals(df, short_window=5, long_window=20)
 
     buy_dates, sell_dates = get_buy_sell_points(df)
@@ -42,8 +63,7 @@ def test_buy_sell_points():
 
 
 def test_ma_calculation():
-    # Use more days to ensure enough trading days after skipping weekends
-    df = generate_mock_data(days=60, start_price=10.0)
+    df = create_test_data(days=60)
     result = generate_signals(df, short_window=5, long_window=20)
 
     # First 4 rows of ma5 should be NaN (need 5 data points)
@@ -58,7 +78,6 @@ def test_ma_calculation():
 
 
 def test_crossover_logic():
-    # Create a controlled test DataFrame to verify crossover detection
     dates = pd.date_range("2026-01-01", periods=10, freq="D")
     data = {
         "open": [10.0] * 10,
@@ -69,10 +88,8 @@ def test_crossover_logic():
     }
     df = pd.DataFrame(data, index=dates)
 
-    # Manually set ma5 and ma20 to create a known crossover scenario
     result = generate_signals(df, short_window=2, long_window=5)
 
-    # Verify signal column exists and contains only valid values
     assert "signal" in result.columns
     assert all(s in [-1, 0, 1] for s in result["signal"])
 

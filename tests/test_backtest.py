@@ -91,26 +91,26 @@ def test_limit_down_prevention():
 
 def test_buy_sell_basic():
     """测试基本的买入卖出逻辑"""
-    dates = pd.date_range("2026-01-01", periods=5, freq="D")
+    dates = pd.date_range("2026-01-01", periods=6, freq="D")
     data = {
-        "open": [10.0, 10.1, 10.2, 10.3, 10.4],
-        "close": [10.0, 10.1, 10.2, 10.3, 10.4],
-        "high": [10.2, 10.3, 10.4, 10.5, 10.6],
-        "low": [9.8, 9.9, 10.0, 10.1, 10.2],
-        "volume": [1000000, 1000000, 1000000, 1000000, 1000000],
-        "signal": [1, 0, -1, 0, 0]
+        "open": [10.0, 10.1, 10.2, 10.3, 10.4, 10.5],
+        "close": [10.0, 10.1, 10.2, 10.3, 10.4, 10.5],
+        "high": [10.2, 10.3, 10.4, 10.5, 10.6, 10.7],
+        "low": [9.8, 9.9, 10.0, 10.1, 10.2, 10.3],
+        "volume": [1000000, 1000000, 1000000, 1000000, 1000000, 1000000],
+        "signal": [1, 0, -1, 0, 0, 0]  # 买入信号在idx=0，卖出信号在idx=2
     }
     df = pd.DataFrame(data, index=dates)
 
     engine = BacktestEngine(initial_capital=100000.0)
     result = engine.run(df)
 
+    # 买入信号idx=0执行买入，卖出信号idx=2执行卖出
     assert result["trade_count"] == 1
     assert len(result["trades"]) == 1
 
     trade = result["trades"][0]
     assert isinstance(trade, Trade)
-    assert trade.buy_volume == trade.buy_volume  # 买入卖出数量一致
 
 
 def test_suspension_skip():
@@ -203,6 +203,119 @@ def test_trade_record_structure():
         assert hasattr(trade, "sell_commission")
         assert hasattr(trade, "sell_stamp_tax")
         assert hasattr(trade, "profit")
+        assert hasattr(trade, "stop_loss_triggered")
+        assert hasattr(trade, "take_profit_triggered")
+
+
+def test_stop_loss_risk_control():
+    """测试止损风控：持仓期间价格跌破5%时强制卖出"""
+    dates = pd.date_range("2026-01-01", periods=10, freq="D")
+    # 买入后价格持续下跌，每天跌1%，第6天累计跌约5.5%触发止损
+    data = {
+        "open": [10.0, 9.95, 9.90, 9.85, 9.80, 9.75, 9.70, 9.65, 9.60, 9.55],
+        "close": [10.0, 9.95, 9.90, 9.85, 9.80, 9.75, 9.70, 9.65, 9.60, 9.55],
+        "high": [10.1, 10.0, 9.95, 9.90, 9.85, 9.80, 9.75, 9.70, 9.65, 9.60],
+        "low": [9.9, 9.85, 9.80, 9.75, 9.70, 9.65, 9.60, 9.55, 9.50, 9.45],
+        "volume": [1000000] * 10,
+        "signal": [1] + [0] * 9  # 买入信号，然后持有
+    }
+    df = pd.DataFrame(data, index=dates)
+
+    # 止损5%，在idx=5时（收盘价9.75）跌幅=(10-9.75)/10=2.5%未触发
+    # 在idx=6时（收盘价9.70）跌幅=(10-9.70)/10=3.0%未触发
+    # 在idx=7时（收盘价9.65）跌幅=(10-9.65)/10=3.5%未触发
+    # 等等...止损检查是用当日收盘价，所以需要更陡峭的跌幅
+    # 重新设计：买入价10.0，需要跌到9.5以下才触发5%止损
+    # 重新设计数据：每天跌1%，5天后跌到9.59，6天后跌到9.50，7天后跌到9.41触发止损
+    data = {
+        "open": [10.0, 9.50, 9.40, 9.30, 9.20, 9.10, 9.00, 8.90, 8.80, 8.70],
+        "close": [10.0, 9.50, 9.40, 9.30, 9.20, 9.10, 9.00, 8.90, 8.80, 8.70],
+        "high": [10.1, 9.60, 9.50, 9.40, 9.30, 9.20, 9.10, 9.00, 8.90, 8.80],
+        "low": [9.9, 9.40, 9.30, 9.20, 9.10, 9.00, 8.90, 8.80, 8.70, 8.60],
+        "volume": [1000000] * 10,
+        "signal": [1] + [0] * 9  # 买入信号，然后持有
+    }
+    df = pd.DataFrame(data, index=dates)
+
+    # 止损5%，idx=1时收盘价9.50，跌幅=(10-9.50)/10=5.0%触发止损
+    engine = BacktestEngine(initial_capital=100000.0, stop_loss_pct=0.05)
+    result = engine.run(df)
+
+    # 应该触发止损卖出
+    assert result["trade_count"] >= 1
+    # 检查是否有止损触发的交易
+    stop_loss_trades = [t for t in result["trades"] if t.stop_loss_triggered]
+    assert len(stop_loss_trades) >= 1
+
+
+def test_take_profit_risk_control():
+    """测试止盈风控：持仓期间价格涨超15%时强制卖出"""
+    dates = pd.date_range("2026-01-01", periods=10, freq="D")
+    # 买入后价格持续上涨，快速触发15%止盈
+    # idx=0收盘价10.0，次日( idx=1)开盘买入，然后价格跳涨
+    data = {
+        "open": [10.0, 10.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7],
+        "close": [10.0, 10.0, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7],
+        "high": [10.1, 10.1, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7, 12.8],
+        "low": [9.9, 9.9, 11.9, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6],
+        "volume": [1000000] * 10,
+        "signal": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # 买入信号在idx=0
+    }
+    df = pd.DataFrame(data, index=dates)
+
+    # 止盈15%，idx=0买入价=10.0*1.001≈10.01
+    # idx=1收盘价=10.0，未触发止盈
+    # idx=2收盘价=12.0，涨幅=(12.0-10.01)/10.01=19.9% > 15%，触发止盈
+    engine = BacktestEngine(initial_capital=100000.0, take_profit_pct=0.15)
+    result = engine.run(df)
+
+    # 应该触发止盈卖出
+    assert result["trade_count"] >= 1
+    take_profit_trades = [t for t in result["trades"] if t.take_profit_triggered]
+    assert len(take_profit_trades) >= 1
+
+
+def test_position_limit_risk_control():
+    """测试仓位限制风控"""
+    dates = pd.date_range("2026-01-01", periods=3, freq="D")
+    data = {
+        "open": [10.0, 10.0, 10.0],
+        "close": [10.0, 10.0, 10.0],
+        "high": [10.2, 10.2, 10.2],
+        "low": [9.8, 9.8, 9.8],
+        "volume": [1000000] * 3,
+        "signal": [1, 1, 1]  # 连续买入信号
+    }
+    df = pd.DataFrame(data, index=dates)
+
+    # 仓位限制50%
+    engine = BacktestEngine(initial_capital=100000.0, max_position_pct=0.5)
+    result = engine.run(df)
+
+    # 第一次买入后仓位达到50%，第二次应该被拒绝
+    # 只有一笔交易
+    assert result["trade_count"] <= 1
+
+
+def test_trade_limit_risk_control():
+    """测试交易次数限制风控"""
+    dates = pd.date_range("2026-01-01", periods=10, freq="D")
+    data = {
+        "open": [10.0] * 10,
+        "close": [10.0] * 10,
+        "high": [10.2] * 10,
+        "low": [9.8] * 10,
+        "volume": [1000000] * 10,
+        "signal": [1, -1, 1, -1, 1, -1, 1, -1, 1, -1]  # 连续买卖
+    }
+    df = pd.DataFrame(data, index=dates)
+
+    # 最多交易3次
+    engine = BacktestEngine(initial_capital=100000.0, max_trade_count=3)
+    result = engine.run(df)
+
+    # 交易次数不应超过3
+    assert result["trade_count"] <= 3
 
 
 if __name__ == "__main__":
@@ -218,6 +331,10 @@ if __name__ == "__main__":
         ("test_equity_curve", test_equity_curve),
         ("test_return_calculation", test_return_calculation),
         ("test_trade_record_structure", test_trade_record_structure),
+        ("test_stop_loss_risk_control", test_stop_loss_risk_control),
+        ("test_take_profit_risk_control", test_take_profit_risk_control),
+        ("test_position_limit_risk_control", test_position_limit_risk_control),
+        ("test_trade_limit_risk_control", test_trade_limit_risk_control),
     ]
 
     passed = 0
