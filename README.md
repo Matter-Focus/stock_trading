@@ -62,5 +62,4 @@ quant-backtest/
 
 ## 开发工具
 
-- Trae（AI辅助编码）
-- coze（辅助框架设计）
+- copilot
